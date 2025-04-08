@@ -10,7 +10,8 @@ from utils.data_utils import get_mnist_loaders
 
 
 def train(model, train_loader, test_loader, optimizer, criterion, device, 
-          num_epochs=10, save_dir='checkpoints', save_prefix='model'):
+          num_epochs=10, save_dir='checkpoints', save_prefix='model',
+          early_stopping=False, patience=5, min_delta=0.0):
     """
     Train the model
     
@@ -24,6 +25,9 @@ def train(model, train_loader, test_loader, optimizer, criterion, device,
         num_epochs: Number of epochs to train for
         save_dir: Directory to save checkpoints
         save_prefix: Prefix for checkpoint filenames
+        early_stopping: Whether to use early stopping
+        patience: Number of epochs to wait for improvement before stopping
+        min_delta: Minimum change in validation accuracy to be considered an improvement
     
     Returns:
         best_acc: Best accuracy achieved during training
@@ -32,6 +36,12 @@ def train(model, train_loader, test_loader, optimizer, criterion, device,
     os.makedirs(save_dir, exist_ok=True)
     
     best_acc = 0.0
+    
+    # Early stopping variables
+    if early_stopping:
+        counter = 0
+        best_valid_acc = 0.0
+        print(f"Early stopping enabled: patience={patience}, min_delta={min_delta}")
     
     for epoch in range(num_epochs):
         # Training phase
@@ -115,6 +125,21 @@ def train(model, train_loader, test_loader, optimizer, criterion, device,
                 best_acc=best_acc
             )
         
+        # Check for early stopping
+        if early_stopping:
+            # Check if current validation accuracy is better than best with minimum delta
+            if test_acc > best_valid_acc + min_delta:
+                best_valid_acc = test_acc
+                counter = 0
+                print(f'  Early stopping: Improvement detected. Counter reset.')
+            else:
+                counter += 1
+                print(f'  Early stopping: No improvement. Counter: {counter}/{patience}')
+                
+                if counter >= patience:
+                    print(f'  Early stopping: Stopping training at epoch {epoch+1} due to no improvement for {patience} epochs.')
+                    break
+        
         # Save latest model
         model.save_checkpoint(
             f'{save_dir}/latest_{save_prefix}.pt',
@@ -133,15 +158,18 @@ def main():
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
     parser.add_argument('--epochs', type=int, default=10, help='Number of epochs to train for')
-    parser.add_argument('--dim', type=int, default=128, help='Hidden dimension size')
+    parser.add_argument('--dim', type=int, default=8, help='Hidden dimension size')
     parser.add_argument('--n_layers', type=int, default=4, help='Number of Mamba layers')
-    parser.add_argument('--d_state', type=int, default=16, help='State dimension')
-    parser.add_argument('--d_conv', type=int, default=4, help='Convolution kernel size')
+    parser.add_argument('--d_state', type=int, default=8, help='State dimension')
+    parser.add_argument('--d_conv', type=int, default=5, help='Convolution kernel size')
     parser.add_argument('--expand', type=int, default=2, help='Expansion factor')
     parser.add_argument('--save_dir', type=str, default='checkpoints', help='Directory to save models')
     parser.add_argument('--save_prefix', type=str, default='mamba_mnist', help='Prefix for saved model files')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for data loading')
     parser.add_argument('--resume', type=str, default='', help='Path to checkpoint to resume from')
+    parser.add_argument('--early_stopping', action='store_true', help='Enable early stopping')
+    parser.add_argument('--patience', type=int, default=5, help='Number of epochs to wait for improvement before stopping')
+    parser.add_argument('--min_delta', type=float, default=0.1, help='Minimum improvement in validation accuracy to reset patience counter')
     args = parser.parse_args()
     
     # Set device
@@ -191,7 +219,10 @@ def main():
         device=device,
         num_epochs=args.epochs,
         save_dir=args.save_dir,
-        save_prefix=args.save_prefix
+        save_prefix=args.save_prefix,
+        early_stopping=args.early_stopping,
+        patience=args.patience,
+        min_delta=args.min_delta
     )
     
     print(f'Training completed! Best accuracy: {best_acc:.2f}%')
