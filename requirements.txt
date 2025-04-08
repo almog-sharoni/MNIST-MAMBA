@@ -1,0 +1,6 @@
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0
+mamba-ssm>=1.0.0
+tqdm
+matplotlib
