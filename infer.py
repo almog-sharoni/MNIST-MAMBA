@@ -1,11 +1,16 @@
+#!/usr/bin/env python3
 import torch
 import torch.nn as nn
+import torch.serialization
 import argparse
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 from tqdm import tqdm
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
 
-from models.mamba_model import MambaMNIST
+from models.mamba_model import MambaMNIST, MambaConfig
 from utils.data_utils import get_mnist_loaders
 
 
@@ -131,9 +136,6 @@ def visualize_confusion_matrix(model, test_loader, device):
             all_labels.extend(targets.cpu().numpy())
     
     # Create confusion matrix
-    from sklearn.metrics import confusion_matrix
-    import seaborn as sns
-    
     cm = confusion_matrix(all_labels, all_preds)
     plt.figure(figsize=(10, 8))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
@@ -153,6 +155,7 @@ def main():
     parser.add_argument('--visualize', action='store_true', help='Visualize predictions')
     parser.add_argument('--confusion', action='store_true', help='Generate confusion matrix')
     parser.add_argument('--num_samples', type=int, default=10, help='Number of samples to visualize')
+    parser.add_argument('--weights_only', action='store_true', help='Use weights_only=True for loading')
     args = parser.parse_args()
     
     # Set device
@@ -161,7 +164,43 @@ def main():
     
     # Load model
     print(f'Loading model from {args.checkpoint}')
-    model, checkpoint = MambaMNIST.load_from_checkpoint(args.checkpoint, map_location=device)
+    try:
+        # Register MambaConfig as a safe global for unpickling
+        torch.serialization.add_safe_globals([MambaConfig])
+        
+        # Load the checkpoint first
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=args.weights_only)
+        # Extract config
+        config = checkpoint.get('config', None)
+        if config is None:
+            # Try to load from separate config file
+            config_path = args.checkpoint.replace('.pt', '_config.pt').replace('.pth', '_config.pth')
+            if os.path.exists(config_path):
+                config = torch.load(config_path, map_location=device)
+        
+        if config is None:
+            raise ValueError("Could not find model configuration")
+        
+        # Create model with just the config
+        model = MambaMNIST(config=config)
+        # Load state dict
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+    except Exception as e:
+        print(f"Failed to load with specified options: {e}")
+        print("Attempting fallback loading method...")
+        try:
+            # Simple fallback - load config from config file directly
+            config_path = args.checkpoint.replace('.pt', '_config.pt')
+            config = torch.load(config_path, map_location=device)
+            model = MambaMNIST(config=config)
+            checkpoint = torch.load(args.checkpoint, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model.eval()
+        except Exception as e2:
+            print(f"Fallback loading also failed: {e2}")
+            raise e2
+    
     model = model.to(device)
     
     # Get test loader

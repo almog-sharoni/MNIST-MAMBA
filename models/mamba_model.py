@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import os
+import pickle
 
 
 def silu(x):
@@ -222,6 +224,9 @@ class MambaMNIST(nn.Module):
         # Input projection from MNIST image to model dimension
         self.input_proj = nn.Linear(config.input_size, config.dim)
         
+        # Add row projection layer (properly initialized in __init__)
+        self.row_proj = nn.Linear(28, config.dim)
+        
         # Layer normalizations
         self.norm_layers = nn.ModuleList([RMSNorm(config.dim) for _ in range(config.n_layers)])
         self.final_norm = RMSNorm(config.dim)
@@ -267,11 +272,7 @@ class MambaMNIST(nn.Module):
         # First reshape to (batch_size * 28, 28) to apply projection to each row
         x_reshaped = x.reshape(-1, 28)
         
-        # Create a new projection layer specifically for row features
-        if not hasattr(self, 'row_proj'):
-            self.row_proj = nn.Linear(28, self.config.dim).to(x.device)
-        
-        # Apply projection to each row
+        # Apply projection to each row using the properly initialized row_proj
         x_projected = self.row_proj(x_reshaped)  # (batch_size * 28, dim)
         
         # Reshape back to (batch_size, 28, dim)
@@ -303,47 +304,84 @@ class MambaMNIST(nn.Module):
         
         return logits
     
-    def save_checkpoint(self, path, optimizer=None, epoch=None, best_acc=None):
+    def save_checkpoint(self, path, optimizer=None, scheduler=None, epoch=None, **kwargs):
         """
         Save model checkpoint
         
         Args:
-            path: Path to save the checkpoint
+            path: Path to save checkpoint
             optimizer: Optimizer state (optional)
+            scheduler: Scheduler state (optional)
             epoch: Current epoch (optional)
-            best_acc: Best accuracy (optional)
+            **kwargs: Additional values to save
         """
         checkpoint = {
             'model_state_dict': self.state_dict(),
-            'config': self.config,
+            'model_args': {'config': self.config},  # Include config in model_args
+            'config': self.config,  # Also save config separately for clearer access
         }
         
         if optimizer is not None:
             checkpoint['optimizer_state_dict'] = optimizer.state_dict()
+        if scheduler is not None:
+            checkpoint['scheduler_state_dict'] = scheduler.state_dict()
         if epoch is not None:
             checkpoint['epoch'] = epoch
-        if best_acc is not None:
-            checkpoint['best_acc'] = best_acc
-            
+        
+        # Add any additional values
+        checkpoint.update(kwargs)
+        
+        # Save the checkpoint
         torch.save(checkpoint, path)
+        
+        # Also save the config separately as a backup
+        config_path = path.replace('.pt', '_config.pt').replace('.pth', '_config.pth')
+        torch.save(self.config, config_path)
     
     @classmethod
-    def load_from_checkpoint(cls, path, map_location=None):
+    def load_from_checkpoint(cls, path, map_location=None, weights_only=False):
         """
         Load model from checkpoint
         
         Args:
-            path: Path to the checkpoint
-            map_location: Device mapping function (optional)
+            path: Path to checkpoint
+            map_location: Location to map tensors to
+            weights_only: Whether to load only weights
             
         Returns:
             model: Loaded model
-            checkpoint: Full checkpoint dictionary
+            checkpoint: Checkpoint data
         """
-        checkpoint = torch.load(path, map_location=map_location)
-        config = checkpoint['config']
+        try:
+            checkpoint = torch.load(path, map_location=map_location, weights_only=weights_only)
+        except (TypeError, pickle.UnpicklingError):
+            # For compatibility with PyTorch versions that don't support weights_only
+            checkpoint = torch.load(path, map_location=map_location)
         
-        model = cls(config)
+        # Extract config and model args
+        model_args = checkpoint.get('model_args', {})
+        config = checkpoint.get('config', None)
+        
+        if config is None:
+            # If still no config, check if there's a separate config file
+            config_path = path.replace('.pt', '_config.pt').replace('.pth', '_config.pth')
+            if os.path.exists(config_path):
+                config = torch.load(config_path, map_location=map_location)
+                
+        if config is None:
+            raise ValueError("Could not find model configuration in the checkpoint. "
+                             "Make sure the checkpoint contains the model config or "
+                             "a separate config file exists.")
+        
+        # Create the model with the config - avoid passing config twice
+        if 'config' in model_args:
+            # Config is already in model_args, use that
+            model = cls(**model_args)
+        else:
+            # Config is not in model_args, pass it directly
+            model = cls(config=config)
+            
         model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
         
         return model, checkpoint
