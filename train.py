@@ -4,9 +4,52 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 import argparse
+import json
+import math
 
 from models.mamba_model import MambaConfig, MambaMNIST
 from utils.data_utils import get_mnist_loaders
+
+
+def save_config_json(config, config_path):
+    """
+    Save model configuration to a JSON file
+    
+    Args:
+        config: MambaConfig object containing model configuration
+        config_path: Path to save the JSON file
+    """
+    # Create config dictionary
+    config_dict = {
+        "model_type": "mamba",
+        "model_name": "mamba-mnist",
+        "input_size": config.input_size,
+        "dim": config.dim,
+        "n_layer": config.n_layers,
+        "d_state": config.d_state,
+        "d_conv": config.d_conv,
+        "expand": config.expand,
+        "d_inner": config.d_inner,
+        "dt_rank": config.dt_rank,
+        "dt_min": config.dt_min,
+        "dt_max": config.dt_max,
+        "dt_init": config.dt_init,
+        "dt_scale": config.dt_scale,
+        "dt_init_floor": config.dt_init_floor,
+        "num_classes": config.num_classes,
+        "vocab_size": config.num_classes  # Set vocab_size same as num_classes for classification
+    }
+    
+    # Save config to file
+    with open(config_path, 'w') as f:
+        json.dump(config_dict, f, indent=4)
+    
+    print(f"Model configuration saved to {config_path}")
+    
+    # Also save as PyTorch file
+    pt_output = config_path.replace('.json', '_config.pt')
+    torch.save(config, pt_output)
+    print(f"MambaConfig object saved to {pt_output}")
 
 
 def train(model, train_loader, test_loader, optimizer, criterion, device, 
@@ -36,6 +79,12 @@ def train(model, train_loader, test_loader, optimizer, criterion, device,
     os.makedirs(save_dir, exist_ok=True)
     
     best_acc = 0.0
+
+    # print model statedict parameters names
+    print("Model parameters:")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"{name}: {param.data.size()}")
     
     # Early stopping variables
     if early_stopping:
@@ -159,9 +208,9 @@ def main():
     parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
     parser.add_argument('--epochs', type=int, default=10, help='Number of epochs to train for')
     parser.add_argument('--dim', type=int, default=8, help='Hidden dimension size')
-    parser.add_argument('--n_layers', type=int, default=4, help='Number of Mamba layers')
-    parser.add_argument('--d_state', type=int, default=8, help='State dimension')
-    parser.add_argument('--d_conv', type=int, default=5, help='Convolution kernel size')
+    parser.add_argument('--n_layers', type=int, default=1, help='Number of Mamba layers')
+    parser.add_argument('--d_state', type=int, default=4, help='State dimension')
+    parser.add_argument('--d_conv', type=int, default=3, help='Convolution kernel size')
     parser.add_argument('--expand', type=int, default=2, help='Expansion factor')
     parser.add_argument('--save_dir', type=str, default='checkpoints', help='Directory to save models')
     parser.add_argument('--save_prefix', type=str, default='mamba_mnist', help='Prefix for saved model files')
@@ -170,6 +219,8 @@ def main():
     parser.add_argument('--early_stopping', action='store_true', help='Enable early stopping')
     parser.add_argument('--patience', type=int, default=5, help='Number of epochs to wait for improvement before stopping')
     parser.add_argument('--min_delta', type=float, default=0.1, help='Minimum improvement in validation accuracy to reset patience counter')
+    parser.add_argument('--save_config', action='store_true', help='Save model configuration to config.json')
+    parser.add_argument('--config_path', type=str, default='config.json', help='Path to save the config.json file')
     args = parser.parse_args()
     
     # Set device
@@ -189,6 +240,11 @@ def main():
         if 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         print(f'Resumed from epoch {start_epoch} with best accuracy {best_acc:.2f}%')
+        
+        # Save config.json if requested
+        if args.save_config:
+            config = model.config
+            save_config_json(config, args.config_path)
     else:
         # Create new model
         config = MambaConfig(
@@ -202,6 +258,10 @@ def main():
         )
         model = MambaMNIST(config)
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        
+        # Save config.json if requested
+        if args.save_config:
+            save_config_json(config, args.config_path)
     
     # Move model to device
     model = model.to(device)
