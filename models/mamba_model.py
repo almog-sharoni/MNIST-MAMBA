@@ -216,172 +216,45 @@ class MambaLayer(nn.Module):
 
 
 class MambaMNIST(nn.Module):
-    """Mamba model adapted for MNIST classification"""
+    """Mamba model for MNIST classification"""
     def __init__(self, config):
         super().__init__()
         self.config = config
         
-        # Input projection from MNIST image to model dimension
+        # Input projection
         self.input_proj = nn.Linear(config.input_size, config.dim)
         
-        # Add row projection layer (properly initialized in __init__)
-        self.row_proj = nn.Linear(28, config.dim)
+        # Mamba layers with normalization
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                'norm': RMSNorm(config.dim),
+                'mamba': MambaLayer(config)
+            }) for _ in range(config.n_layers)
+        ])
         
-        # Layer normalizations
-        self.norm_layers = nn.ModuleList([RMSNorm(config.dim) for _ in range(config.n_layers)])
-        self.final_norm = RMSNorm(config.dim)
-        
-        # Mamba layers
-        self.layers = nn.ModuleList([MambaLayer(config) for _ in range(config.n_layers)])
-        
-        # Classification head
-        self.classifier = nn.Linear(config.dim, config.num_classes)
-        
-        # Initialize weights
-        self.apply(self._init_weights)
-        
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            # Standard initialization for linear layers
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
+        # Output head
+        self.norm_f = RMSNorm(config.dim)
+        self.output_head = nn.Linear(config.dim, config.num_classes)
     
     def forward(self, x):
-        """
-        Forward pass for MNIST classification
+        # Reshape input: (batch, 1, 28, 28) -> (batch, 784)
+        batch_size = x.size(0)
+        x = x.view(batch_size, -1)
         
-        Args:
-            x: Input tensor of shape (batch_size, 1, 28, 28)
-                
-        Returns:
-            logits: Output logits (batch_size, num_classes)
-        """
-        batch_size = x.shape[0]
+        # Project to model dimension: (batch, 784) -> (batch, 1, dim)
+        x = self.input_proj(x).unsqueeze(1)
         
-        # Reshape MNIST images to sequence format:
-        # Original shape: (batch_size, 1, 28, 28)
-        # We want: (batch_size, seq_len=28, feature_dim=28)
-        # Each row of pixels becomes a token in our sequence
-        x = x.view(batch_size, 1, 28, 28).squeeze(1)  # Remove channel dim
-        x = x.float()  # Ensure float type
+        # Apply Mamba layers
+        for layer in self.layers:
+            # Pre-normalization
+            x_norm = layer['norm'](x)
+            # Mamba layer
+            x = x + layer['mamba'](x_norm)
         
-        # Now shape is (batch_size, 28, 28) - each row is a "token" with 28 features
+        # Final normalization and pool
+        x = self.norm_f(x).squeeze(1)
         
-        # Project each row (each with 28 features) to model dimension
-        # First reshape to (batch_size * 28, 28) to apply projection to each row
-        x_reshaped = x.reshape(-1, 28)
-        
-        # Apply projection to each row using the properly initialized row_proj
-        x_projected = self.row_proj(x_reshaped)  # (batch_size * 28, dim)
-        
-        # Reshape back to (batch_size, 28, dim)
-        x = x_projected.view(batch_size, 28, self.config.dim)
-        
-        # Forward through each Mamba layer with residual connections
-        hidden_states = x
-        
-        # Rest of the forward pass remains the same
-        for i, layer in enumerate(self.layers):
-            # Apply layer normalization
-            normed_states = self.norm_layers[i](hidden_states)
-            
-            # Forward through Mamba layer
-            layer_output = layer(normed_states)
-            
-            # Residual connection
-            hidden_states = hidden_states + layer_output
-        
-        # Final normalization
-        hidden_states = self.final_norm(hidden_states)
-        
-        # Take the representation from the last "token" (last row of the image)
-        # Alternative: could use mean pooling across all positions
-        final_representation = hidden_states[:, -1]  # (batch_size, dim)
-        
-        # Classify
-        logits = self.classifier(final_representation)
+        # Classification head
+        logits = self.output_head(x)
         
         return logits
-    
-    def save_checkpoint(self, path, optimizer=None, scheduler=None, epoch=None, **kwargs):
-        """
-        Save model checkpoint
-        
-        Args:
-            path: Path to save checkpoint
-            optimizer: Optimizer state (optional)
-            scheduler: Scheduler state (optional)
-            epoch: Current epoch (optional)
-            **kwargs: Additional values to save
-        """
-        checkpoint = {
-            'model_state_dict': self.state_dict(),
-            'model_args': {'config': self.config},  # Include config in model_args
-            'config': self.config,  # Also save config separately for clearer access
-        }
-        
-        if optimizer is not None:
-            checkpoint['optimizer_state_dict'] = optimizer.state_dict()
-        if scheduler is not None:
-            checkpoint['scheduler_state_dict'] = scheduler.state_dict()
-        if epoch is not None:
-            checkpoint['epoch'] = epoch
-        
-        # Add any additional values
-        checkpoint.update(kwargs)
-        
-        # Save the checkpoint
-        torch.save(checkpoint, path)
-        
-        # Also save the config separately as a backup
-        config_path = path.replace('.pt', '_config.pt').replace('.pth', '_config.pth')
-        torch.save(self.config, config_path)
-    
-    @classmethod
-    def load_from_checkpoint(cls, path, map_location=None, weights_only=False):
-        """
-        Load model from checkpoint
-        
-        Args:
-            path: Path to checkpoint
-            map_location: Location to map tensors to
-            weights_only: Whether to load only weights
-            
-        Returns:
-            model: Loaded model
-            checkpoint: Checkpoint data
-        """
-        try:
-            checkpoint = torch.load(path, map_location=map_location, weights_only=weights_only)
-        except (TypeError, pickle.UnpicklingError):
-            # For compatibility with PyTorch versions that don't support weights_only
-            checkpoint = torch.load(path, map_location=map_location)
-        
-        # Extract config and model args
-        model_args = checkpoint.get('model_args', {})
-        config = checkpoint.get('config', None)
-        
-        if config is None:
-            # If still no config, check if there's a separate config file
-            config_path = path.replace('.pt', '_config.pt').replace('.pth', '_config.pth')
-            if os.path.exists(config_path):
-                config = torch.load(config_path, map_location=map_location)
-                
-        if config is None:
-            raise ValueError("Could not find model configuration in the checkpoint. "
-                             "Make sure the checkpoint contains the model config or "
-                             "a separate config file exists.")
-        
-        # Create the model with the config - avoid passing config twice
-        if 'config' in model_args:
-            # Config is already in model_args, use that
-            model = cls(**model_args)
-        else:
-            # Config is not in model_args, pass it directly
-            model = cls(config=config)
-            
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-        
-        return model, checkpoint

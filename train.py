@@ -1,292 +1,129 @@
-import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from tqdm import tqdm
-import argparse
-import json
-import math
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+from models.mamba_model import MambaMNIST, MambaConfig
+import matplotlib.pyplot as plt
+import os
 
-from models.mamba_model import MambaConfig, MambaMNIST
-from utils.data_utils import get_mnist_loaders
-
-
-def save_config_json(config, config_path):
-    """
-    Save model configuration to a JSON file
-    
-    Args:
-        config: MambaConfig object containing model configuration
-        config_path: Path to save the JSON file
-    """
-    # Create config dictionary
-    config_dict = {
-        "model_type": "mamba",
-        "model_name": "mamba-mnist",
-        "input_size": config.input_size,
-        "dim": config.dim,
-        "n_layer": config.n_layers,
-        "d_state": config.d_state,
-        "d_conv": config.d_conv,
-        "expand": config.expand,
-        "d_inner": config.d_inner,
-        "dt_rank": config.dt_rank,
-        "dt_min": config.dt_min,
-        "dt_max": config.dt_max,
-        "dt_init": config.dt_init,
-        "dt_scale": config.dt_scale,
-        "dt_init_floor": config.dt_init_floor,
-        "num_classes": config.num_classes,
-        "vocab_size": config.num_classes  # Set vocab_size same as num_classes for classification
-    }
-    
-    # Save config to file
-    with open(config_path, 'w') as f:
-        json.dump(config_dict, f, indent=4)
-    
-    print(f"Model configuration saved to {config_path}")
-    
-    # Also save as PyTorch file
-    pt_output = config_path.replace('.json', '_config.pt')
-    torch.save(config, pt_output)
-    print(f"MambaConfig object saved to {pt_output}")
-
-
-def train(model, train_loader, test_loader, optimizer, criterion, device, 
-          num_epochs=10, save_dir='checkpoints', save_prefix='model',
-          early_stopping=False, patience=5, min_delta=0.0):
-    """
-    Train the model
-    
-    Args:
-        model: Model to train
-        train_loader: DataLoader for training data
-        test_loader: DataLoader for test data
-        optimizer: Optimizer to use
-        criterion: Loss function
-        device: Device to train on
-        num_epochs: Number of epochs to train for
-        save_dir: Directory to save checkpoints
-        save_prefix: Prefix for checkpoint filenames
-        early_stopping: Whether to use early stopping
-        patience: Number of epochs to wait for improvement before stopping
-        min_delta: Minimum change in validation accuracy to be considered an improvement
-    
-    Returns:
-        best_acc: Best accuracy achieved during training
-    """
-    # Create directory for saving checkpoints
+def train_mamba_mnist(
+    batch_size=128,
+    epochs=10,
+    learning_rate=0.001,
+    save_dir='checkpoints',
+    device="cuda" if torch.cuda.is_available() else "cpu"
+):
+    # Create save directory
     os.makedirs(save_dir, exist_ok=True)
     
-    best_acc = 0.0
-
-    # print model statedict parameters names
-    print("Model parameters:")
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            print(f"{name}: {param.data.size()}")
+    # Load MNIST dataset
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
     
-    # Early stopping variables
-    if early_stopping:
-        counter = 0
-        best_valid_acc = 0.0
-        print(f"Early stopping enabled: patience={patience}, min_delta={min_delta}")
+    train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
+    test_dataset = datasets.MNIST('./data', train=False, transform=transform)
     
-    for epoch in range(num_epochs):
-        # Training phase
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    
+    # Initialize model
+    config = MambaConfig()
+    model = MambaMNIST(config).to(device)
+    
+    # Loss and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+    
+    # Training tracking
+    train_losses = []
+    test_accuracies = []
+    best_accuracy = 0.0
+    best_epoch = 0
+    
+    for epoch in range(epochs):
         model.train()
-        total_loss = 0.0
-        correct = 0
-        total = 0
+        running_loss = 0.0
         
-        # Training with progress bar
-        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
-        for inputs, targets in train_pbar:
-            inputs, targets = inputs.to(device), targets.to(device)
+        for batch_idx, (data, target) in enumerate(train_loader):
+            data, target = data.to(device), target.to(device)
             
-            # Forward pass
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            
-            # Backward pass
+            output = model(data)
+            loss = criterion(output, target)
             loss.backward()
             optimizer.step()
             
-            # Calculate accuracy
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
+            running_loss += loss.item()
             
-            # Update metrics
-            total_loss += loss.item() * inputs.size(0)
-            train_acc = 100. * correct / total
-            train_loss = total_loss / total
-            
-            # Update progress bar
-            train_pbar.set_postfix({
-                'loss': f'{train_loss:.4f}',
-                'acc': f'{train_acc:.2f}%'
-            })
+            if batch_idx % 100 == 0:
+                print(f'Epoch {epoch+1}/{epochs} [{batch_idx * len(data)}/{len(train_loader.dataset)} '
+                      f'({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}')
         
-        # Evaluation phase
+        # Evaluate on test set
         model.eval()
-        test_loss = 0.0
-        test_correct = 0
-        test_total = 0
+        correct = 0
+        total = 0
         
-        test_pbar = tqdm(test_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Test]')
         with torch.no_grad():
-            for inputs, targets in test_pbar:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                
-                # Calculate accuracy
-                _, predicted = outputs.max(1)
-                test_total += targets.size(0)
-                test_correct += predicted.eq(targets).sum().item()
-                
-                # Update metrics
-                test_loss += loss.item() * inputs.size(0)
-                test_acc = 100. * test_correct / test_total
-                avg_test_loss = test_loss / test_total
-                
-                # Update progress bar
-                test_pbar.set_postfix({
-                    'loss': f'{avg_test_loss:.4f}',
-                    'acc': f'{test_acc:.2f}%'
-                })
+            for data, target in test_loader:
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                _, predicted = torch.max(output.data, 1)
+                total += target.size(0)
+                correct += (predicted == target).sum().item()
         
-        # Print epoch summary
-        print(f'Epoch {epoch+1}/{num_epochs}:')
-        print(f'  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
-        print(f'  Test Loss: {avg_test_loss:.4f}, Test Acc: {test_acc:.2f}%')
+        accuracy = 100 * correct / total
+        avg_loss = running_loss / len(train_loader)
+        train_losses.append(avg_loss)
+        test_accuracies.append(accuracy)
+        
+        print(f'Epoch {epoch+1} complete. Average loss: {avg_loss:.4f}, '
+              f'Test accuracy: {accuracy:.2f}%')
         
         # Save best model
-        if test_acc > best_acc:
-            best_acc = test_acc
-            print(f'  New best accuracy: {best_acc:.2f}% - Saving model...')
-            model.save_checkpoint(
-                f'{save_dir}/best_{save_prefix}.pt',
-                optimizer=optimizer,
-                epoch=epoch,
-                best_acc=best_acc
-            )
-        
-        # Check for early stopping
-        if early_stopping:
-            # Check if current validation accuracy is better than best with minimum delta
-            if test_acc > best_valid_acc + min_delta:
-                best_valid_acc = test_acc
-                counter = 0
-                print(f'  Early stopping: Improvement detected. Counter reset.')
-            else:
-                counter += 1
-                print(f'  Early stopping: No improvement. Counter: {counter}/{patience}')
-                
-                if counter >= patience:
-                    print(f'  Early stopping: Stopping training at epoch {epoch+1} due to no improvement for {patience} epochs.')
-                    break
-        
-        # Save latest model
-        model.save_checkpoint(
-            f'{save_dir}/latest_{save_prefix}.pt',
-            optimizer=optimizer,
-            epoch=epoch,
-            best_acc=best_acc
-        )
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_epoch = epoch
+            # Save model
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'accuracy': accuracy,
+                'config': config,
+            }
+            torch.save(checkpoint, os.path.join(save_dir, 'best_model.pth'))
+            print(f'New best model saved with accuracy: {accuracy:.2f}%')
     
-    return best_acc
+    # Plot and save training results
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses)
+    plt.title('Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(test_accuracies)
+    plt.title('Test Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'training_results.png'))
+    plt.close()
+    
+    print(f"\nTraining completed!")
+    print(f"Best model saved at epoch {best_epoch+1} with accuracy: {best_accuracy:.2f}%")
+    
+    # Load best model for return
+    checkpoint = torch.load(os.path.join(save_dir, 'best_model.pth'))
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    return model, train_losses, test_accuracies
 
-
-def main():
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Train Mamba model on MNIST')
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training')
-    parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
-    parser.add_argument('--epochs', type=int, default=10, help='Number of epochs to train for')
-    parser.add_argument('--dim', type=int, default=8, help='Hidden dimension size')
-    parser.add_argument('--n_layers', type=int, default=1, help='Number of Mamba layers')
-    parser.add_argument('--d_state', type=int, default=4, help='State dimension')
-    parser.add_argument('--d_conv', type=int, default=3, help='Convolution kernel size')
-    parser.add_argument('--expand', type=int, default=2, help='Expansion factor')
-    parser.add_argument('--save_dir', type=str, default='checkpoints', help='Directory to save models')
-    parser.add_argument('--save_prefix', type=str, default='mamba_mnist', help='Prefix for saved model files')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for data loading')
-    parser.add_argument('--resume', type=str, default='', help='Path to checkpoint to resume from')
-    parser.add_argument('--early_stopping', action='store_true', help='Enable early stopping')
-    parser.add_argument('--patience', type=int, default=5, help='Number of epochs to wait for improvement before stopping')
-    parser.add_argument('--min_delta', type=float, default=0.1, help='Minimum improvement in validation accuracy to reset patience counter')
-    parser.add_argument('--save_config', action='store_true', help='Save model configuration to config.json')
-    parser.add_argument('--config_path', type=str, default='config.json', help='Path to save the config.json file')
-    args = parser.parse_args()
-    
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
-    
-    # Get data loaders
-    train_loader, test_loader = get_mnist_loaders(batch_size=args.batch_size, num_workers=args.num_workers)
-    
-    # Create model
-    if args.resume:
-        print(f'Loading model from {args.resume}')
-        model, checkpoint = MambaMNIST.load_from_checkpoint(args.resume, map_location=device)
-        start_epoch = checkpoint.get('epoch', 0) + 1
-        best_acc = checkpoint.get('best_acc', 0.0)
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        if 'optimizer_state_dict' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        print(f'Resumed from epoch {start_epoch} with best accuracy {best_acc:.2f}%')
-        
-        # Save config.json if requested
-        if args.save_config:
-            config = model.config
-            save_config_json(config, args.config_path)
-    else:
-        # Create new model
-        config = MambaConfig(
-            input_size=28*28,  # MNIST image size
-            dim=args.dim,
-            n_layers=args.n_layers,
-            d_state=args.d_state,
-            d_conv=args.d_conv,
-            expand=args.expand,
-            num_classes=10    # 10 digits
-        )
-        model = MambaMNIST(config)
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        
-        # Save config.json if requested
-        if args.save_config:
-            save_config_json(config, args.config_path)
-    
-    # Move model to device
-    model = model.to(device)
-    
-    # Set up loss function
-    criterion = nn.CrossEntropyLoss()
-    
-    # Train the model
-    best_acc = train(
-        model=model,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        optimizer=optimizer,
-        criterion=criterion,
-        device=device,
-        num_epochs=args.epochs,
-        save_dir=args.save_dir,
-        save_prefix=args.save_prefix,
-        early_stopping=args.early_stopping,
-        patience=args.patience,
-        min_delta=args.min_delta
-    )
-    
-    print(f'Training completed! Best accuracy: {best_acc:.2f}%')
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    model, losses, accuracies = train_mamba_mnist()
