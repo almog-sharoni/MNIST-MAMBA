@@ -7,6 +7,8 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
+#include <stdint.h>  // Add this include for uint32_t
+#include <stdbool.h>
 #if defined _WIN32
     #include "win.h"
 #else
@@ -126,8 +128,8 @@ void memory_map_weights(MambaWeights *w, Config* p, float* ptr) {
     
     // Debug helper function
     void debug_weight(const char* name, float* weight, int size) {
-        printf("reading %s: first values: %f %f %f %f\n", 
-               name, weight[0], weight[1], weight[2], weight[3]);
+        // printf("reading %s: first values: %f %f %f %f\n", 
+        //        name, weight[0], weight[1], weight[2], weight[3]);
     }
     
     // get the pointers to the weights
@@ -502,155 +504,64 @@ float* forward(Mamba* mamba, float* input) {
     return s->logits;
 }
 
-// Add these structures after the existing ones, before main()
-typedef struct {
-    float* images;  // flattened array of images (n_images * 784)
-    unsigned char* labels;  // array of labels (n_images)
-    int n_images;
-} MNISTDataset;
-
-void load_mnist_file(const char* image_path, const char* label_path, MNISTDataset* dataset) {
-    FILE *img_file = fopen(image_path, "rb");
-    FILE *label_file = fopen(label_path, "rb");
-    if (!img_file || !label_file) { 
-        fprintf(stderr, "Failed to open MNIST files\n"); 
-        exit(1); 
-    }
-
-    // Read header info
-    int magic, n_images, n_rows, n_cols;
-    fread(&magic, 4, 1, img_file);
-    fread(&n_images, 4, 1, img_file);
-    fread(&n_rows, 4, 1, img_file);
-    fread(&n_cols, 4, 1, img_file);
-    
-    // Convert from big-endian
-    n_images = ((n_images & 0xFF000000) >> 24) | ((n_images & 0x00FF0000) >> 8) |
-               ((n_images & 0x0000FF00) << 8)  | ((n_images & 0x000000FF) << 24);
-
-    // Skip label header
-    fread(&magic, 4, 1, label_file);
-    fread(&magic, 4, 1, label_file);
-
-    // Allocate memory
-    dataset->n_images = n_images;
-    dataset->images = malloc(n_images * 784 * sizeof(float));
-    dataset->labels = malloc(n_images * sizeof(unsigned char));
-
-    // Read images and normalize
-    unsigned char pixel;
-    for (int i = 0; i < n_images * 784; i++) {
-        fread(&pixel, 1, 1, img_file);
-        dataset->images[i] = pixel / 255.0f;
-    }
-
-    // Read labels
-    fread(dataset->labels, 1, n_images, label_file);
-
-    fclose(img_file);
-    fclose(label_file);
-}
-
-void free_mnist_dataset(MNISTDataset* dataset) {
-    free(dataset->images);
-    free(dataset->labels);
-}
-
-float evaluate_model(Mamba* mamba, MNISTDataset* dataset) {
-    int correct = 0;
-    
-    // Process all images
-    for (int i = 0; i < dataset->n_images; i++) {
-        // Get prediction
-        float* logits = forward(mamba, &dataset->images[i * 784]);
-        
-        // Find predicted class
-        int predicted_class = 0;
-        float max_prob = logits[0];
-        for (int j = 1; j < mamba->config.num_classes; j++) {
-            if (logits[j] > max_prob) {
-                max_prob = logits[j];
-                predicted_class = j;
-            }
-        }
-        
-        // Check if correct
-        if (predicted_class == dataset->labels[i]) {
-            correct++;
-        }
-
-        // Print progress every 1000 images
-        if ((i + 1) % 1000 == 0) {
-            fprintf(stderr, "Processed %d/%d images. Current accuracy: %.2f%%\n", 
-                    i + 1, dataset->n_images, (100.0f * correct) / (i + 1));
-        }
-
-        // Reset internal state for next image
-        reset_internal_state(mamba);
-    }
-    
-    return (100.0f * correct) / dataset->n_images;
-}
-
-// Replace the existing main() with this version
 int main(int argc, char *argv[]) {
-    if (argc != 3 && argc != 4) {
-        fprintf(stderr, "Usage:\n");
-        fprintf(stderr, "  Single image: %s <model.bin> <input.bin>\n", argv[0]);
-        fprintf(stderr, "  Full dataset: %s <model.bin> <mnist_images.bin> <mnist_labels.bin>\n", argv[0]);
-        exit(1);
+    bool quiet_mode = false;
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--quiet") == 0) {
+            quiet_mode = true;
+        }
     }
+
+    // if (argc != 3) {
+    //     fprintf(stderr, "Usage: %s <model.bin> <input.bin>\n", argv[0]);
+    //     fprintf(stderr, "Input file should contain 784 float32 values for MNIST image\n");
+    //     exit(1);
+    // }
 
     // Load model
     Mamba mamba;
     load_model(&mamba, argv[1]);
+    if (quiet_mode) {
+        // don't print anything
+    } else {
     fprintf(stderr, "Model loaded: input_size=%d, dim=%d, n_layers=%d\n",
             mamba.config.input_size, mamba.config.dim, mamba.config.n_layers);
-
-    if (argc == 3) {
-        // Single image mode
-        float input[784];
-        FILE* f = fopen(argv[2], "rb");
-        if (!f) { 
-            fprintf(stderr, "Failed to open input file %s\n", argv[2]); 
-            exit(1); 
-        }
-        
-        // Read raw float32 data directly
-        size_t read = fread(input, sizeof(float), 784, f);
-        if (read != 784) {
-            fprintf(stderr, "Failed to read input, got %zu values, expected 784\n", read);
-            exit(1);
-        }
-        fclose(f);
-
-        // Run inference
-        float* logits = forward(&mamba, input);
-
-        // Find highest probability class
-        int max_class = 0;
-        float max_prob = logits[0];
-        for (int i = 1; i < mamba.config.num_classes; i++) {
-            if (logits[i] > max_prob) {
-                max_prob = logits[i];
-                max_class = i;
-            }
-        }
-        
-        printf("%d\n", max_class);
-        
-    } else {
-        // Full dataset evaluation mode
-        MNISTDataset dataset;
-        load_mnist_file(argv[2], argv[3], &dataset);
-        fprintf(stderr, "Dataset loaded: %d images\n", dataset.n_images);
-
-        float accuracy = evaluate_model(&mamba, &dataset);
-        printf("Final accuracy: %.2f%%\n", accuracy);
-
-        free_mnist_dataset(&dataset);
     }
+    // Load input image
+    float input[784];
+    FILE* f = fopen(argv[2], "rb");
+    if (!f) { 
+        fprintf(stderr, "Failed to open input file %s\n", argv[2]); 
+        exit(1); 
+    }
+    
+    size_t read = fread(input, sizeof(float), 784, f);
+    if (read != 784) {
+        fprintf(stderr, "Failed to read input, got %zu values, expected 784\n", read);
+        exit(1);
+    }
+    fclose(f);
 
+    // Run inference
+    float* logits = forward(&mamba, input);
+
+    // Find highest probability class
+    int max_class = 0;
+    float max_prob = logits[0];
+    for (int i = 1; i < mamba.config.num_classes; i++) {
+        if (logits[i] > max_prob) {
+            max_prob = logits[i];
+            max_class = i;
+        }
+    }
+    
+    if (quiet_mode) {
+        printf("%d\n", max_class);
+    } else {
+        printf("Predicted class: %d with probability: %f\n", max_class, max_prob);
+    }
+    
     free_model(&mamba);
     return 0;
 }
