@@ -89,6 +89,40 @@ Run inference using the C implementation:
 ./mamba mnist_mamba.bin input.bin
 ```
 
+## Export Tools
+
+The `export.py` script provides several commands to prepare data for the C model:
+
+### Export Trained Model
+Convert a PyTorch checkpoint to binary format for C inference:
+```bash
+python export.py model [--checkpoint PATH] [--output mnist_mamba.bin]
+```
+
+### Export Single Test Image
+Export a single MNIST test image for inference:
+```bash
+python export.py image [--index N] [--output input.bin]
+```
+
+### Export Full Dataset
+Export entire MNIST dataset (test or train) for batch evaluation:
+```bash
+python export.py dataset [--train] [--images mnist_images.bin] [--labels mnist_labels.bin]
+```
+
+## C Model Usage
+
+### Single Image Inference
+```bash
+./mamba model.bin input.bin
+```
+
+### Full Dataset Evaluation
+```bash
+./mamba model.bin mnist_images.bin mnist_labels.bin
+```
+
 ## Model Architecture
 
 The implementation uses a Mamba-based architecture with the following key components:

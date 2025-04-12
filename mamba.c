@@ -124,20 +124,63 @@ void free_run_state(RunState* s) {
 void memory_map_weights(MambaWeights *w, Config* p, float* ptr) {
     unsigned long long n_layers = p->n_layers;
     
+    // Debug helper function
+    void debug_weight(const char* name, float* weight, int size) {
+        printf("reading %s: first values: %f %f %f %f\n", 
+               name, weight[0], weight[1], weight[2], weight[3]);
+    }
+    
     // get the pointers to the weights
-    w->input_proj = ptr;           ptr += p->dim * p->input_size;
-    w->in_proj = ptr;              ptr += n_layers * (2 * p->d_inner) * p->dim;
-    w->conv1d_weight = ptr;        ptr += n_layers * p->d_inner * 1 * p->d_conv;
-    w->conv1d_bias = ptr;          ptr += n_layers * p->d_inner;
-    w->x_proj = ptr;               ptr += n_layers * (p->dt_rank + 2 * p->d_state) * p->d_inner;
-    w->dt_proj_weight = ptr;       ptr += n_layers * p->d_inner * p->dt_rank;
-    w->dt_proj_bias = ptr;         ptr += n_layers * p->d_inner;
-    w->A = ptr;                    ptr += n_layers * p->d_inner * p->d_state;
-    w->D = ptr;                    ptr += n_layers * p->d_inner;
-    w->out_proj = ptr;             ptr += n_layers * p->dim * p->d_inner;
-    w->norm = ptr;                 ptr += n_layers * p->dim;
-    w->final_norm = ptr;           ptr += p->dim;
-    w->classifier = ptr;           ptr += p->num_classes * p->dim;
+    w->input_proj = ptr;
+    debug_weight("input_proj", ptr, p->dim * p->input_size);
+    ptr += p->dim * p->input_size;
+    
+    w->in_proj = ptr;
+    debug_weight("in_proj", ptr, n_layers * (2 * p->d_inner) * p->dim);
+    ptr += n_layers * (2 * p->d_inner) * p->dim;
+    
+    w->conv1d_weight = ptr;
+    debug_weight("conv1d_weight", ptr, n_layers * p->d_inner * p->d_conv);
+    ptr += n_layers * p->d_inner * 1 * p->d_conv;
+    
+    w->conv1d_bias = ptr;
+    debug_weight("conv1d_bias", ptr, n_layers * p->d_inner);
+    ptr += n_layers * p->d_inner;
+    
+    w->x_proj = ptr;
+    debug_weight("x_proj", ptr, n_layers * (p->dt_rank + 2 * p->d_state) * p->d_inner);
+    ptr += n_layers * (p->dt_rank + 2 * p->d_state) * p->d_inner;
+    
+    w->dt_proj_weight = ptr; 
+    debug_weight("dt_proj_weight", ptr, n_layers * p->d_inner * p->dt_rank);
+    ptr += n_layers * p->d_inner * p->dt_rank;
+    
+    w->dt_proj_bias = ptr;
+    debug_weight("dt_proj_bias", ptr, n_layers * p->d_inner);
+    ptr += n_layers * p->d_inner;
+    
+    w->A = ptr;
+    debug_weight("A", ptr, n_layers * p->d_inner * p->d_state);
+    ptr += n_layers * p->d_inner * p->d_state;
+    
+    w->D = ptr;
+    debug_weight("D", ptr, n_layers * p->d_inner);
+    ptr += n_layers * p->d_inner;
+    
+    w->out_proj = ptr;
+    debug_weight("out_proj", ptr, n_layers * p->dim * p->d_inner);
+    ptr += n_layers * p->dim * p->d_inner;
+    
+    w->norm = ptr;
+    debug_weight("norm", ptr, n_layers * p->dim);
+    ptr += n_layers * p->dim;
+    
+    w->final_norm = ptr;
+    debug_weight("final_norm", ptr, p->dim);
+    ptr += p->dim;
+    
+    w->classifier = ptr;
+    debug_weight("classifier", ptr, p->num_classes * p->dim);
 }
 
 void load_model_file(char* model_path, Config* config, MambaWeights* weights,
@@ -459,51 +502,155 @@ float* forward(Mamba* mamba, float* input) {
     return s->logits;
 }
 
-// #ifndef TESTING
-int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <model.bin> <input.bin>\n", argv[0]);
-        fprintf(stderr, "Input file should contain 784 float32 values for MNIST image\n");
-        exit(1);
+// Add these structures after the existing ones, before main()
+typedef struct {
+    float* images;  // flattened array of images (n_images * 784)
+    unsigned char* labels;  // array of labels (n_images)
+    int n_images;
+} MNISTDataset;
+
+void load_mnist_file(const char* image_path, const char* label_path, MNISTDataset* dataset) {
+    FILE *img_file = fopen(image_path, "rb");
+    FILE *label_file = fopen(label_path, "rb");
+    if (!img_file || !label_file) { 
+        fprintf(stderr, "Failed to open MNIST files\n"); 
+        exit(1); 
+    }
+
+    // Read header info
+    int magic, n_images, n_rows, n_cols;
+    fread(&magic, 4, 1, img_file);
+    fread(&n_images, 4, 1, img_file);
+    fread(&n_rows, 4, 1, img_file);
+    fread(&n_cols, 4, 1, img_file);
+    
+    // Convert from big-endian
+    n_images = ((n_images & 0xFF000000) >> 24) | ((n_images & 0x00FF0000) >> 8) |
+               ((n_images & 0x0000FF00) << 8)  | ((n_images & 0x000000FF) << 24);
+
+    // Skip label header
+    fread(&magic, 4, 1, label_file);
+    fread(&magic, 4, 1, label_file);
+
+    // Allocate memory
+    dataset->n_images = n_images;
+    dataset->images = malloc(n_images * 784 * sizeof(float));
+    dataset->labels = malloc(n_images * sizeof(unsigned char));
+
+    // Read images and normalize
+    unsigned char pixel;
+    for (int i = 0; i < n_images * 784; i++) {
+        fread(&pixel, 1, 1, img_file);
+        dataset->images[i] = pixel / 255.0f;
+    }
+
+    // Read labels
+    fread(dataset->labels, 1, n_images, label_file);
+
+    fclose(img_file);
+    fclose(label_file);
+}
+
+void free_mnist_dataset(MNISTDataset* dataset) {
+    free(dataset->images);
+    free(dataset->labels);
+}
+
+float evaluate_model(Mamba* mamba, MNISTDataset* dataset) {
+    int correct = 0;
+    
+    // Process all images
+    for (int i = 0; i < dataset->n_images; i++) {
+        // Get prediction
+        float* logits = forward(mamba, &dataset->images[i * 784]);
+        
+        // Find predicted class
+        int predicted_class = 0;
+        float max_prob = logits[0];
+        for (int j = 1; j < mamba->config.num_classes; j++) {
+            if (logits[j] > max_prob) {
+                max_prob = logits[j];
+                predicted_class = j;
+            }
+        }
+        
+        // Check if correct
+        if (predicted_class == dataset->labels[i]) {
+            correct++;
+        }
+
+        // Print progress every 1000 images
+        if ((i + 1) % 1000 == 0) {
+            fprintf(stderr, "Processed %d/%d images. Current accuracy: %.2f%%\n", 
+                    i + 1, dataset->n_images, (100.0f * correct) / (i + 1));
+        }
+
+        // Reset internal state for next image
+        reset_internal_state(mamba);
     }
     
+    return (100.0f * correct) / dataset->n_images;
+}
+
+// Replace the existing main() with this version
+int main(int argc, char *argv[]) {
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "Usage:\n");
+        fprintf(stderr, "  Single image: %s <model.bin> <input.bin>\n", argv[0]);
+        fprintf(stderr, "  Full dataset: %s <model.bin> <mnist_images.bin> <mnist_labels.bin>\n", argv[0]);
+        exit(1);
+    }
+
     // Load model
     Mamba mamba;
     load_model(&mamba, argv[1]);
-    
-    // Print config
     fprintf(stderr, "Model loaded: input_size=%d, dim=%d, n_layers=%d\n",
             mamba.config.input_size, mamba.config.dim, mamba.config.n_layers);
-    
-    // Load input image
-    FILE* f = fopen(argv[2], "rb");
-    if (!f) { fprintf(stderr, "Failed to open input file\n"); exit(1); }
-    
-    float input[784];
-    if (fread(input, sizeof(float), 784, f) != 784) {
-        fprintf(stderr, "Failed to read input\n");
-        exit(1);
-    }
-    fclose(f);
-    
-    // Run inference
-    float* logits = forward(&mamba, input);
-    
-    // Find highest probability class
-    int max_class = 0;
-    float max_prob = logits[0];
-    for (int i = 1; i < mamba.config.num_classes; i++) {
-        if (logits[i] > max_prob) {
-            max_prob = logits[i];
-            max_class = i;
+
+    if (argc == 3) {
+        // Single image mode
+        float input[784];
+        FILE* f = fopen(argv[2], "rb");
+        if (!f) { 
+            fprintf(stderr, "Failed to open input file %s\n", argv[2]); 
+            exit(1); 
         }
+        
+        // Read raw float32 data directly
+        size_t read = fread(input, sizeof(float), 784, f);
+        if (read != 784) {
+            fprintf(stderr, "Failed to read input, got %zu values, expected 784\n", read);
+            exit(1);
+        }
+        fclose(f);
+
+        // Run inference
+        float* logits = forward(&mamba, input);
+
+        // Find highest probability class
+        int max_class = 0;
+        float max_prob = logits[0];
+        for (int i = 1; i < mamba.config.num_classes; i++) {
+            if (logits[i] > max_prob) {
+                max_prob = logits[i];
+                max_class = i;
+            }
+        }
+        
+        printf("%d\n", max_class);
+        
+    } else {
+        // Full dataset evaluation mode
+        MNISTDataset dataset;
+        load_mnist_file(argv[2], argv[3], &dataset);
+        fprintf(stderr, "Dataset loaded: %d images\n", dataset.n_images);
+
+        float accuracy = evaluate_model(&mamba, &dataset);
+        printf("Final accuracy: %.2f%%\n", accuracy);
+
+        free_mnist_dataset(&dataset);
     }
-    
-    // Print prediction
-    printf("%d\n", max_class);
-    
-    // Cleanup
+
     free_model(&mamba);
     return 0;
 }
-// #endif

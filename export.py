@@ -25,8 +25,11 @@ def serialize_fp32(file, tensor):
 
 def write_weights(file, tensor, key):
     """ writes the layer weights to file """
+    d = tensor.detach().cpu().view(-1).to(torch.float32).numpy()
     print(f"writing {key} {list(tensor.shape)[::-1]}")
-    serialize_fp32(file, tensor)
+    print(f"  first values: {d[:4]}")  # Print first 4 values
+    b = struct.pack(f'{len(d)}f', *d)
+    file.write(b)
 
 def model_export(model, config, filepath):
     """Export the MNIST Mamba model weights in float32 .bin file"""
@@ -200,6 +203,44 @@ def export_best_model(checkpoint_path='checkpoints/best_model.pth', export_path=
     model_export(model, config, export_path)
     print(f"Model exported to {export_path}")
 
+def export_mnist_dataset(output_images="mnist_images.bin", output_labels="mnist_labels.bin", train=False):
+    """Export entire MNIST dataset to binary format for C model evaluation"""
+    # Load MNIST dataset
+    mnist = torchvision.datasets.MNIST(root='./data', train=train, download=True)
+    
+    # Get total number of images
+    n_images = len(mnist)
+    print(f"Exporting {n_images} {'training' if train else 'test'} images...")
+    
+    # Prepare images array
+    images = np.zeros((n_images, 784), dtype=np.float32)
+    labels = np.zeros(n_images, dtype=np.uint8)
+    
+    # Convert all images
+    for i in range(n_images):
+        image, label = mnist[i]
+        images[i] = np.array(image, dtype=np.float32).reshape(784) / 255.0
+        labels[i] = label
+        if (i + 1) % 1000 == 0:
+            print(f"Processed {i + 1}/{n_images} images")
+    
+    # Save images to binary file
+    with open(output_images, 'wb') as f:
+        # Write header (magic number, number of images, rows, cols)
+        f.write(struct.pack('>IIII', 2051, n_images, 28, 28))
+        # Write data
+        f.write(images.tobytes())
+    
+    # Save labels to binary file
+    with open(output_labels, 'wb') as f:
+        # Write header (magic number, number of items)
+        f.write(struct.pack('>II', 2049, n_images))
+        # Write data
+        f.write(labels.tobytes())
+    
+    print(f"Exported {n_images} images to {output_images}")
+    print(f"Exported {n_images} labels to {output_labels}")
+
 # -----------------------------------------------------------------------------
 # CLI entrypoint
 
@@ -221,11 +262,22 @@ if __name__ == "__main__":
     image_parser.add_argument('--output', type=str, default='input.bin',
                             help='Output binary file path')
     
+    # Dataset export command
+    dataset_parser = subparsers.add_parser('dataset', help='Export entire MNIST dataset to binary format')
+    dataset_parser.add_argument('--train', action='store_true',
+                              help='Export training set instead of test set')
+    dataset_parser.add_argument('--images', type=str, default='mnist_images.bin',
+                              help='Output images file path')
+    dataset_parser.add_argument('--labels', type=str, default='mnist_labels.bin',
+                              help='Output labels file path')
+    
     args = parser.parse_args()
     
     if args.command == 'model':
         export_best_model(args.checkpoint, args.output)
     elif args.command == 'image':
         export_mnist_image(args.index, args.output)
+    elif args.command == 'dataset':
+        export_mnist_dataset(args.images, args.labels, args.train)
     else:
         parser.print_help()

@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import os
 
 def train_mamba_mnist(
-    batch_size=128,
+    batch_size=1024,
     epochs=10,
     learning_rate=0.001,
     save_dir='checkpoints',

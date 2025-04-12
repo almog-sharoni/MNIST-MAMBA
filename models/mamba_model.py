@@ -37,9 +37,9 @@ class MambaConfig:
     def __init__(self, 
                  input_size=28*28,  # MNIST image flattened size
                  dim=128,          # Hidden dimension size
-                 n_layers=4,       # Number of Mamba layers
-                 d_state=16,       # State dimension
-                 d_conv=4,         # Convolution kernel size
+                 n_layers=1,       # Number of Mamba layers
+                 d_state=8,       # State dimension
+                 d_conv=5,         # Convolution kernel size
                  expand=2,         # Expansion factor for inner dimension
                  num_classes=10,   # Number of output classes (digits 0-9)
                  dt_rank=None,     # Rank of delta (timestep) projection
@@ -235,6 +235,57 @@ class MambaMNIST(nn.Module):
         # Output head
         self.norm_f = RMSNorm(config.dim)
         self.output_head = nn.Linear(config.dim, config.num_classes)
+
+    @classmethod
+    def load_from_checkpoint(cls, checkpoint_path, map_location=None):
+        """Load model from checkpoint file.
+        
+        Args:
+            checkpoint_path (str): Path to the checkpoint file
+            map_location (str or torch.device): Device to load the model onto
+            
+        Returns:
+            tuple: (model, checkpoint_dict)
+        """
+        # Allow MambaConfig in torch.load
+        import torch.serialization
+        torch.serialization.add_safe_globals([MambaConfig])
+        
+        try:
+            # Try loading with weights_only=False since we need the config
+            checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            raise
+        
+        # Get model configuration - try both possible locations
+        config = checkpoint.get('config', None)
+        if config is None and 'model_args' in checkpoint:
+            config = checkpoint['model_args'].get('config', None)
+            
+        if config is None:
+            raise ValueError("Checkpoint does not contain model configuration")
+            
+        # Ensure config is a MambaConfig instance
+        if not isinstance(config, MambaConfig):
+            # If it's a dict, convert to MambaConfig
+            if isinstance(config, dict):
+                config = MambaConfig(**config)
+            else:
+                raise ValueError(f"Invalid config type: {type(config)}")
+            
+        # Create new model instance with loaded config
+        model = cls(config)
+        
+        # Load state dictionary
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        elif 'state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['state_dict'])
+        else:
+            raise ValueError("Checkpoint does not contain model state dict")
+        
+        return model, checkpoint
     
     def forward(self, x):
         # Reshape input: (batch, 1, 28, 28) -> (batch, 784)
