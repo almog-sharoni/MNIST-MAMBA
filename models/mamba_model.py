@@ -36,7 +36,7 @@ class MambaConfig:
     """Configuration class for Mamba model for MNIST"""
     def __init__(self, 
                  input_size=28*28,  # MNIST image flattened size
-                 dim=128,          # Hidden dimension size
+                 dim=16,          # Hidden dimension size
                  n_layers=1,       # Number of Mamba layers
                  d_state=8,       # State dimension
                  d_conv=5,         # Convolution kernel size
