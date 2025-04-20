@@ -8,8 +8,8 @@ import matplotlib.pyplot as plt
 import os
 
 def train_mamba_mnist(
-    batch_size=1024,
-    epochs=10,
+    batch_size=16,
+    epochs=100,
     learning_rate=0.001,
     save_dir='checkpoints',
     device="cuda" if torch.cuda.is_available() else "cpu"

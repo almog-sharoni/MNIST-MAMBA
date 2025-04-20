@@ -283,13 +283,26 @@ void shift_matrix_left(float* matrix, int rows, int cols) {
         for (int j = 0; j < cols - 1; j++) {
             matrix[i * cols + j] = matrix[i * cols + j + 1];
         }
+        // Set last column to zero after shifting
+        matrix[i * cols + cols - 1] = 0.0f;
+    }
+}
+
+void initialize_conv_state(float* conv_state, int d_inner, int d_conv) {
+    // Initialize with zeros for padding=d_conv-1 on the left side
+    #pragma omp parallel for
+    for (int i = 0; i < d_inner; i++) {
+        for (int j = 0; j < d_conv; j++) {
+            conv_state[i * d_conv + j] = 0.0f;
+        }
     }
 }
 
 void update_last_column(float* matrix, float* x, int rows, int cols) {
+    // Update the last column with new input values
     #pragma omp parallel for
     for (int i = 0; i < rows; i++) {
-        matrix[i * cols + cols - 1] = x[i];
+        matrix[i * cols + (cols - 1)] = x[i];
     }
 }
 
@@ -406,19 +419,20 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
 
 
     // Conv step
-
-    // conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
+    // In PyTorch, conv1d weight shape is (d_inner, 1, d_conv) for groups=d_inner
+    // Each channel convolves with its own d_conv filter
     shift_matrix_left(conv_state, d_inner, d_conv);
-    // conv_state[:, -1] = x
     update_last_column(conv_state, x, d_inner, d_conv);
-    // x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
-    elementwise_multiply(s->temp, conv_state, w->conv1d_weight + l*d_inner*d_conv, d_inner * d_conv);
-    sum_along_last_dim(x, s->temp, d_inner, d_conv);
-    // x = x + self.conv1d.bias
-    elementwise_add(x, x, w->conv1d_bias + l*d_inner, d_inner);
-    // x = F.silu(x)
+    
+    // Depthwise convolution - each channel uses its own filter
+    #pragma omp parallel for
     for (int i = 0; i < d_inner; i++) {
-        x[i] = silu(x[i]);
+        float sum = 0.0f;
+        for (int j = 0; j < d_conv; j++) {
+            sum += conv_state[i * d_conv + j] * w->conv1d_weight[l*d_inner*d_conv + i*d_conv + j];
+        }
+        x[i] = sum + w->conv1d_bias[l*d_inner + i];  // Add bias per channel
+        x[i] = x[i] * sigmoid(x[i]);  // SiLU activation: x * sigmoid(x)
     }
 
 
