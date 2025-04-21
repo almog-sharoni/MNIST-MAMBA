@@ -12,7 +12,7 @@ def train_mamba_mnist(
     epochs=100,
     learning_rate=0.001,
     save_dir='checkpoints',
-    device="cuda" if torch.cuda.is_available() else "cpu"
+    device="cpu" if torch.cuda.is_available() else "cpu"
 ):
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)

@@ -15,6 +15,14 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+
+// Include LEO2 hardware accelerator headers
+#include "leo2_libs.h"
+#include "mannix_accelerator.h"
+#include "mannix_main.h"
+#include "mannix_regs_define.h"
+#include "mannixlib.h"
+
 // ----------------------------------------------------------------------------
 // Mamba model
 
@@ -74,6 +82,14 @@ typedef struct {
     int fd; // file descriptor for memory mapping
     float* data; // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
+    
+    // LEO2 hardware accelerator structures
+    Allocator_t allocator;
+    MatAllocator_t mat_allocator;
+    char fm_do_pad_allign;
+    Matrix_t *hw_matrices; // Array to hold hardware matrices
+    int hw_matrices_count;
+    int hw_initialized;
 } Mamba;
 
 void malloc_run_state(RunState* s, Config* p) {
@@ -215,8 +231,13 @@ void load_model_file(char* model_path, Config* config, MambaWeights* weights,
 void load_model(Mamba* m, char* model_path) {
     // read the Config and the Weights from the model file
     load_model_file(model_path, &m->config, &m->weights, &m->fd, &m->data, &m->file_size);
+    
     // allocate the RunState buffers
     malloc_run_state(&m->state, &m->config);
+    
+    // Initialize hardware accelerator structures
+    m->hw_initialized = 0;
+    initialize_hw_accelerator(m);
 }
 
 void free_model(Mamba* m) {
@@ -225,6 +246,102 @@ void free_model(Mamba* m) {
     if (m->fd != -1) { close(m->fd); }
     // free the RunState buffers
     free_run_state(&m->state);
+}
+
+// Initialize LEO2 hardware accelerator for Mamba model
+void initialize_hw_accelerator(Mamba* m) {
+    if (m->hw_initialized) return;
+    
+    Config* p = &m->config;
+    int dim = p->dim, d_inner = p->d_inner, dt_rank = p->dt_rank, d_state = p->d_state;
+    int input_size = p->input_size, num_classes = p->num_classes;
+    
+    // Allocate memory for hardware matrices
+    // We need matrices for:
+    // 1. input_proj, in_proj, x_proj, dt_proj, out_proj, classifier
+    // 2. Various intermediate results like xz, x_db, etc.
+    int max_matrix_count = p->n_layers * 10 + 10; // Conservative estimate
+    
+    // Allocate memory for hw matrices array
+    m->hw_matrices = (Matrix_t*)malloc(max_matrix_count * sizeof(Matrix_t));
+    m->hw_matrices_count = 0;
+    
+    // Create shared memory allocator - size depends on our model parameters
+    // This is a conservative estimate of memory needed
+    size_t mem_size = p->n_layers * (
+        dim * input_size +           // input_proj
+        2 * d_inner * dim +          // in_proj
+        (dt_rank + 2 * d_state) * d_inner + // x_proj
+        d_inner * dt_rank +          // dt_proj_weight
+        dim * d_inner +              // out_proj
+        num_classes * dim            // classifier
+    ) * sizeof(float) + 1024 * 1024; // Extra buffer
+
+    // Allocate memory
+    char* data = (char*)malloc(mem_size);
+    if (!data) {
+        fprintf(stderr, "Failed to allocate memory for hardware accelerator\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    // Create allocator
+    createAllocator(&m->allocator, data, mem_size);
+    
+    // Create matrix allocator
+    createMatrixAllocator(&m->mat_allocator, m->hw_matrices, max_matrix_count);
+    
+    // Set padding alignment for memory
+    m->fm_do_pad_allign = 1;
+    
+    m->hw_initialized = 1;
+    
+    printf("LEO2 hardware accelerator initialized\n");
+}
+
+// Create a hardware compatible matrix from host float array with int8 quantization
+Matrix_t* create_hw_matrix(Mamba* m, int rows, int cols, float* data) {
+    Matrix_t* matrix = &m->hw_matrices[m->hw_matrices_count++];
+    creatMatrix(rows, cols, matrix, &m->allocator, m->fm_do_pad_allign);
+    
+    // Copy data from host array to hardware memory
+    // Since LEO2 only supports int8, we need to quantize float to int8
+    for (int i = 0; i < rows * cols; i++) {
+        if (data) {
+            // Quantize float to int8 range (-127 to 127)
+            float scaled_val = data[i] * 127.0f;
+            // Clamp to int8 range to avoid overflow
+            if (scaled_val > 127.0f) scaled_val = 127.0f;
+            if (scaled_val < -127.0f) scaled_val = -127.0f;
+            // Convert to int8
+            char val = (char)scaled_val;
+            put_byte_over_apb((volatile char*)(matrix->data + i), val, 0);
+        } else {
+            // Zero initialization
+            put_byte_over_apb((volatile char*)(matrix->data + i), 0, 0);
+        }
+    }
+    
+    return matrix;
+}
+
+// Free hardware accelerator resources
+void free_hw_accelerator(Mamba* m) {
+    if (!m->hw_initialized) return;
+    
+    // Free allocated memory
+    if (m->allocator.data) {
+        free(m->allocator.data);
+        m->allocator.data = NULL;
+    }
+    
+    // Free hw_matrices array
+    if (m->hw_matrices) {
+        free(m->hw_matrices);
+        m->hw_matrices = NULL;
+    }
+    
+    m->hw_matrices_count = 0;
+    m->hw_initialized = 0;
 }
 
 // ----------------------------------------------------------------------------
@@ -332,6 +449,63 @@ void matmul(float* xout, float* x, float* w, int d, int n) {
     }
 }
 
+// Hardware-accelerated matrix multiplication
+void hw_matmul(Mamba* mamba, float* xout, float* x, float* w, int d, int n) {
+    if (!mamba->hw_initialized) {
+        // Fallback to CPU implementation if hardware not initialized
+        matmul(xout, x, w, d, n);
+        return;
+    }
+    
+    // Create matrices for LEO2 hardware accelerator
+    // Input matrix (n x 1)
+    Matrix_t in_matrix;
+    creatMatrix(n, 1, &in_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+    
+    // Weight matrix (d x n)
+    Matrix_t weight_matrix;
+    creatMatrix(d, n, &weight_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+    
+    // Output matrix (d x 1)
+    Matrix_t out_matrix;
+    creatMatrix(d, 1, &out_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+    
+    // Create dummy bias vector (required by hardware API but not used)
+    Matrix_t dummy_bias;
+    creatMatrix(d, 1, &dummy_bias, &mamba->allocator, mamba->fm_do_pad_allign);
+    
+    // Convert float input to hardware format and copy to in_matrix
+    for (int i = 0; i < n; i++) {
+        // Convert float to int8/char for hardware
+        char val = (char)(x[i] * 127.0f);
+        put_byte_over_apb((volatile char*)(in_matrix.data + i), val, 0);
+    }
+    
+    // Convert float weights to hardware format and copy to weight_matrix
+    for (int i = 0; i < d; i++) {
+        for (int j = 0; j < n; j++) {
+            // Convert float to int8/char for hardware
+            char val = (char)(w[i * n + j] * 127.0f);
+            put_byte_over_apb((volatile char*)(weight_matrix.data + i * n + j), val, 0);
+        }
+    }
+    
+    // Initialize bias with zeros
+    for (int i = 0; i < d; i++) {
+        put_byte_over_apb((volatile char*)(dummy_bias.data + i), 0, 0);
+    }
+    
+    // Call hardware accelerator for matrix multiplication
+    xlrtr_fc_with_activate(&in_matrix, &weight_matrix, &dummy_bias, &out_matrix, 0, mamba->fm_do_pad_allign);
+    
+    // Convert hardware result back to float and copy to xout
+    for (int i = 0; i < d; i++) {
+        // Read output from hardware memory and convert back to float
+        char val = get_byte_over_apb((volatile char*)(out_matrix.data + i), 0);
+        xout[i] = val / 127.0f;  // Convert from int8 to float
+    }
+}
+
 void linear(float* xout, float* x, float* w, float* b, int d, int n) {
     // w[d,n] @ x[n] + b[d] -> xout[d]
     #pragma omp parallel for
@@ -412,7 +586,54 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     float* ssm_state  = s->ssm_state  + l * d_inner * d_state;
 
     // xz = self.in_proj(hidden_states)  # hidden_states: (dim), in_proj (2*d_inner, dim), xz (2*d_inner)
-    matmul(s->xz, hidden_state, w->in_proj + l * 2*d_inner*dim, 2*d_inner, dim);
+    // Using hardware acceleration for matrix multiplication
+    if (mamba->hw_initialized) {
+        // Create hardware matrices
+        Matrix_t in_matrix;
+        Matrix_t weight_matrix;
+        Matrix_t out_matrix;
+        Matrix_t dummy_bias;
+        
+        // Setup input matrix (dim x 1)
+        creatMatrix(dim, 1, &in_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup weight matrix (2*d_inner x dim)
+        creatMatrix(2*d_inner, dim, &weight_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup output matrix (2*d_inner x 1)
+        creatMatrix(2*d_inner, 1, &out_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup dummy bias (required by hardware but not used)
+        creatMatrix(2*d_inner, 1, &dummy_bias, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Copy data to hardware memory
+        for (int i = 0; i < dim; i++) {
+            char val = (char)(hidden_state[i] * 127.0f);
+            put_byte_over_apb(&(((volatile char *)in_matrix.data)[i]), val, 0);
+        }
+        
+        for (int i = 0; i < 2*d_inner; i++) {
+            for (int j = 0; j < dim; j++) {
+                char val = (char)(w->in_proj[l * 2*d_inner*dim + i*dim + j] * 127.0f);
+                put_byte_over_apb(&(((volatile char *)weight_matrix.data)[i*dim + j]), val, 0);
+            }
+            // Initialize bias with zeros
+            put_byte_over_apb(&(((volatile char *)dummy_bias.data)[i]), 0, 0);
+        }
+        
+        // Call hardware accelerator
+        xlrtr_fc_with_activate(&in_matrix, &weight_matrix, &dummy_bias, &out_matrix, 0, mamba->fm_do_pad_allign);
+        
+        // Copy results back
+        for (int i = 0; i < 2*d_inner; i++) {
+            char val = get_byte_over_apb(&(((volatile char *)out_matrix.data)[i]), 0);
+            s->xz[i] = val / 127.0f;
+        }
+    } else {
+        // Fallback to CPU implementation
+        matmul(s->xz, hidden_state, w->in_proj + l * 2*d_inner*dim, 2*d_inner, dim);
+    }
+    
     // x, z = xz.chunk(2, dim=-1)
     float* x = s->xz;            // x (d_inner)
     float* z = s->xz + d_inner;  // z (d_inner)
@@ -425,6 +646,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     update_last_column(conv_state, x, d_inner, d_conv);
     
     // Depthwise convolution - each channel uses its own filter
+    // Keep on CPU as it's not efficiently mapped to LEO2 FC accelerator
     #pragma omp parallel for
     for (int i = 0; i < d_inner; i++) {
         float sum = 0.0f;
@@ -439,14 +661,107 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     // SSM step
 
     // x_db = self.x_proj(x)   # x_db (dt_rank+2*d_state)
-    matmul(s->x_db, x, w->x_proj + l*(dt_rank+2*d_state)*d_inner, dt_rank+2*d_state, d_inner);
+    if (mamba->hw_initialized) {
+        // Create hardware matrices
+        Matrix_t in_matrix;
+        Matrix_t weight_matrix;
+        Matrix_t out_matrix;
+        Matrix_t dummy_bias;
+        
+        // Setup input matrix (d_inner x 1)
+        creatMatrix(d_inner, 1, &in_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup weight matrix (dt_rank+2*d_state x d_inner)
+        creatMatrix(dt_rank+2*d_state, d_inner, &weight_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup output matrix (dt_rank+2*d_state x 1)
+        creatMatrix(dt_rank+2*d_state, 1, &out_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup dummy bias
+        creatMatrix(dt_rank+2*d_state, 1, &dummy_bias, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Copy data to hardware memory
+        for (int i = 0; i < d_inner; i++) {
+            char val = (char)(x[i] * 127.0f);
+            put_byte_over_apb(&(((volatile char *)in_matrix.data)[i]), val, 0);
+        }
+        
+        for (int i = 0; i < dt_rank+2*d_state; i++) {
+            for (int j = 0; j < d_inner; j++) {
+                char val = (char)(w->x_proj[l*(dt_rank+2*d_state)*d_inner + i*d_inner + j] * 127.0f);
+                put_byte_over_apb(&(((volatile char *)weight_matrix.data)[i*d_inner + j]), val, 0);
+            }
+            // Initialize bias with zeros
+            put_byte_over_apb(&(((volatile char *)dummy_bias.data)[i]), 0, 0);
+        }
+        
+        // Call hardware accelerator
+        xlrtr_fc_with_activate(&in_matrix, &weight_matrix, &dummy_bias, &out_matrix, 0, mamba->fm_do_pad_allign);
+        
+        // Copy results back
+        for (int i = 0; i < dt_rank+2*d_state; i++) {
+            char val = get_byte_over_apb(&(((volatile char *)out_matrix.data)[i]), 0);
+            s->x_db[i] = val / 127.0f;
+        }
+    } else {
+        // Fallback to CPU implementation
+        matmul(s->x_db, x, w->x_proj + l*(dt_rank+2*d_state)*d_inner, dt_rank+2*d_state, d_inner);
+    }
+    
     // dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
     float *dt = s->x_db;                     // dt (dt_rank)
     float *B = s->x_db + dt_rank;            // B  (d_state)
     float *C = s->x_db + dt_rank + d_state;  // C  (d_state)
 
     // dt = self.dt_proj(dt)   # dt (dt_rank), dt_proj_weight (d_inner, dt_rank), dt_proj_bias (d_inner)
-    linear(s->dt, dt, w->dt_proj_weight + l*d_inner*dt_rank, w->dt_proj_bias + l*d_inner, d_inner, dt_rank);
+    if (mamba->hw_initialized) {
+        // Create hardware matrices
+        Matrix_t in_matrix;
+        Matrix_t weight_matrix;
+        Matrix_t bias_matrix;
+        Matrix_t out_matrix;
+        
+        // Setup input matrix (dt_rank x 1)
+        creatMatrix(dt_rank, 1, &in_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup weight matrix (d_inner x dt_rank)
+        creatMatrix(d_inner, dt_rank, &weight_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup bias matrix (d_inner x 1)
+        creatMatrix(d_inner, 1, &bias_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup output matrix (d_inner x 1)
+        creatMatrix(d_inner, 1, &out_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Copy data to hardware memory
+        for (int i = 0; i < dt_rank; i++) {
+            char val = (char)(dt[i] * 127.0f);
+            put_byte_over_apb(&(((volatile char *)in_matrix.data)[i]), val, 0);
+        }
+        
+        for (int i = 0; i < d_inner; i++) {
+            for (int j = 0; j < dt_rank; j++) {
+                char val = (char)(w->dt_proj_weight[l*d_inner*dt_rank + i*dt_rank + j] * 127.0f);
+                put_byte_over_apb(&(((volatile char *)weight_matrix.data)[i*dt_rank + j]), val, 0);
+            }
+            // Copy bias values
+            char bias_val = (char)(w->dt_proj_bias[l*d_inner + i] * 127.0f);
+            put_byte_over_apb(&(((volatile char *)bias_matrix.data)[i]), bias_val, 0);
+        }
+        
+        // Call hardware accelerator
+        xlrtr_fc_with_activate(&in_matrix, &weight_matrix, &bias_matrix, &out_matrix, 0, mamba->fm_do_pad_allign);
+        
+        // Copy results back
+        for (int i = 0; i < d_inner; i++) {
+            char val = get_byte_over_apb(&(((volatile char *)out_matrix.data)[i]), 0);
+            s->dt[i] = val / 127.0f;
+        }
+    } else {
+        // Fallback to CPU implementation
+        linear(s->dt, dt, w->dt_proj_weight + l*d_inner*dt_rank, w->dt_proj_bias + l*d_inner, d_inner, dt_rank);
+    }
+    
     dt = s->dt;  // NOTE: dt is now bigger: (d_inner) instead of (dt_rank)
     // dt = F.softplus(dt)
     for (int i = 0; i < d_inner; i++) {
@@ -478,7 +793,52 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     }
 
     // hidden_state = self.out_proj(y)  # out_proj (dim, d_inner), hidden_state (dim)
-    matmul(hidden_state, y, w->out_proj + l*dim*d_inner, dim, d_inner);
+    if (mamba->hw_initialized) {
+        // Create hardware matrices
+        Matrix_t in_matrix;
+        Matrix_t weight_matrix;
+        Matrix_t out_matrix;
+        Matrix_t dummy_bias;
+        
+        // Setup input matrix (d_inner x 1)
+        creatMatrix(d_inner, 1, &in_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup weight matrix (dim x d_inner)
+        creatMatrix(dim, d_inner, &weight_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup output matrix (dim x 1)
+        creatMatrix(dim, 1, &out_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup dummy bias
+        creatMatrix(dim, 1, &dummy_bias, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Copy data to hardware memory
+        for (int i = 0; i < d_inner; i++) {
+            char val = (char)(y[i] * 127.0f);
+            put_byte_over_apb(&(((volatile char *)in_matrix.data)[i]), val, 0);
+        }
+        
+        for (int i = 0; i < dim; i++) {
+            for (int j = 0; j < d_inner; j++) {
+                char val = (char)(w->out_proj[l*dim*d_inner + i*d_inner + j] * 127.0f);
+                put_byte_over_apb(&(((volatile char *)weight_matrix.data)[i*d_inner + j]), val, 0);
+            }
+            // Initialize bias with zeros
+            put_byte_over_apb(&(((volatile char *)dummy_bias.data)[i]), 0, 0);
+        }
+        
+        // Call hardware accelerator
+        xlrtr_fc_with_activate(&in_matrix, &weight_matrix, &dummy_bias, &out_matrix, 0, mamba->fm_do_pad_allign);
+        
+        // Copy results back
+        for (int i = 0; i < dim; i++) {
+            char val = get_byte_over_apb(&(((volatile char *)out_matrix.data)[i]), 0);
+            hidden_state[i] = val / 127.0f;
+        }
+    } else {
+        // Fallback to CPU implementation
+        matmul(hidden_state, y, w->out_proj + l*dim*d_inner, dim, d_inner);
+    }
 }
 
 float* forward(Mamba* mamba, float* input) {
@@ -489,34 +849,128 @@ float* forward(Mamba* mamba, float* input) {
     int dim = p->dim;
     float *hidden_state = s->hidden_state;
     
-    // Project input to model dimension
-    matmul(hidden_state, input, w->input_proj, dim, p->input_size);
+    // Project input to model dimension using hardware acceleration
+    if (mamba->hw_initialized) {
+        // Create hardware matrices
+        Matrix_t in_matrix;
+        Matrix_t weight_matrix;
+        Matrix_t out_matrix;
+        Matrix_t dummy_bias;
+        
+        // Setup input matrix (input_size x 1)
+        creatMatrix(p->input_size, 1, &in_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup weight matrix (dim x input_size)
+        creatMatrix(dim, p->input_size, &weight_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup output matrix (dim x 1)
+        creatMatrix(dim, 1, &out_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup dummy bias
+        creatMatrix(dim, 1, &dummy_bias, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Copy input data to hardware memory
+        for (int i = 0; i < p->input_size; i++) {
+            char val = (char)(input[i] * 127.0f);
+            put_byte_over_apb(&(((volatile char *)in_matrix.data)[i]), val, 0);
+        }
+        
+        // Copy weight data to hardware memory
+        for (int i = 0; i < dim; i++) {
+            for (int j = 0; j < p->input_size; j++) {
+                char val = (char)(w->input_proj[i * p->input_size + j] * 127.0f);
+                put_byte_over_apb(&(((volatile char *)weight_matrix.data)[i * p->input_size + j]), val, 0);
+            }
+            // Initialize bias with zeros
+            put_byte_over_apb(&(((volatile char *)dummy_bias.data)[i]), 0, 0);
+        }
+        
+        // Call hardware accelerator
+        xlrtr_fc_with_activate(&in_matrix, &weight_matrix, &dummy_bias, &out_matrix, 0, mamba->fm_do_pad_allign);
+        
+        // Copy results back to hidden_state
+        for (int i = 0; i < dim; i++) {
+            char val = get_byte_over_apb(&(((volatile char *)out_matrix.data)[i]), 0);
+            hidden_state[i] = val / 127.0f;
+        }
+    } else {
+        // Fallback to CPU implementation
+        matmul(hidden_state, input, w->input_proj, dim, p->input_size);
+    }
+    
     memcpy(s->input, hidden_state, dim * sizeof(float));
     
-    // forward all layers
+    // Forward all layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
-        // normalize input
+        // Normalize input
         rmsnorm(hidden_state, s->input, w->norm + l * dim, dim);
-        // forward layer
+        // Forward layer (already hardware-accelerated)
         forward_layer(mamba, l, hidden_state);
-        // residual connection
+        // Residual connection
         for (int i = 0; i < dim; i++) {
             hidden_state[i] += s->input[i];
             s->input[i] = hidden_state[i];
         }
     }
     
-    // final normalization
+    // Final normalization
     rmsnorm(hidden_state, hidden_state, w->final_norm, dim);
     
-    // classifier head
-    matmul(s->logits, hidden_state, w->classifier, p->num_classes, dim);
+    // Classifier head using hardware acceleration
+    if (mamba->hw_initialized) {
+        // Create hardware matrices
+        Matrix_t in_matrix;
+        Matrix_t weight_matrix;
+        Matrix_t out_matrix;
+        Matrix_t dummy_bias;
+        
+        // Setup input matrix (dim x 1)
+        creatMatrix(dim, 1, &in_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup weight matrix (num_classes x dim)
+        creatMatrix(p->num_classes, dim, &weight_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup output matrix (num_classes x 1)
+        creatMatrix(p->num_classes, 1, &out_matrix, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Setup dummy bias
+        creatMatrix(p->num_classes, 1, &dummy_bias, &mamba->allocator, mamba->fm_do_pad_allign);
+        
+        // Copy input data to hardware memory
+        for (int i = 0; i < dim; i++) {
+            char val = (char)(hidden_state[i] * 127.0f);
+            put_byte_over_apb(&(((volatile char *)in_matrix.data)[i]), val, 0);
+        }
+        
+        // Copy classifier weights to hardware memory
+        for (int i = 0; i < p->num_classes; i++) {
+            for (int j = 0; j < dim; j++) {
+                char val = (char)(w->classifier[i * dim + j] * 127.0f);
+                put_byte_over_apb(&(((volatile char *)weight_matrix.data)[i * dim + j]), val, 0);
+            }
+            // Initialize bias with zeros
+            put_byte_over_apb(&(((volatile char *)dummy_bias.data)[i]), 0, 0);
+        }
+        
+        // Call hardware accelerator
+        xlrtr_fc_with_activate(&in_matrix, &weight_matrix, &dummy_bias, &out_matrix, 0, mamba->fm_do_pad_allign);
+        
+        // Copy results back to logits
+        for (int i = 0; i < p->num_classes; i++) {
+            char val = get_byte_over_apb(&(((volatile char *)out_matrix.data)[i]), 0);
+            s->logits[i] = val / 127.0f;
+        }
+    } else {
+        // Fallback to CPU implementation
+        matmul(s->logits, hidden_state, w->classifier, p->num_classes, dim);
+    }
     
-    // apply softmax
+    // Apply softmax (keep on CPU as it's not a matrix multiplication)
     softmax(s->logits, p->num_classes);
     
     return s->logits;
 }
+
 
 int main(int argc, char *argv[]) {
     bool quiet_mode = false;
