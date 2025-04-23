@@ -792,7 +792,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
         y[i] = y[i] * silu(z[i]);
     }
 
-    // hidden_state = self.out_proj(y)  # out_proj (dim, d_inner), hidden_state (dim)
+    // hidden_state = self.out_proj(y)  # out_proj (dim, d_inner), hidden_state (dim)˜
     if (mamba->hw_initialized) {
         // Create hardware matrices
         Matrix_t in_matrix;
